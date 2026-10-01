@@ -1,4 +1,4 @@
-name: OneShot APK to iOS v1 - Godot 4.3 Native
+name: OneShot APK to iOS v1.1 - Godot 4.3 Native
 
 on:
   workflow_dispatch:
@@ -16,21 +16,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Find APK
+      - name: Find or download APK
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
           APK=""
 
-          if [ -f "MRevisionDevBuildJan212025.apk" ]; then
+          if [ -f "$GITHUB_WORKSPACE/MRevisionDevBuildJan212025.apk" ]; then
             APK="$GITHUB_WORKSPACE/MRevisionDevBuildJan212025.apk"
           else
-            APK="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -iname '*.apk' -print -quit)"
+            APK="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -iname '*.apk' -print -quit || true)"
           fi
 
           if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-            echo "ERROR: APK not found. Put MRevisionDevBuildJan212025.apk in the repo root."
+            echo "APK is not in the git checkout. Looking in the latest GitHub Release..."
+
+            RELEASE_DIR="$RUNNER_TEMP/oneshot-release"
+            rm -rf "$RELEASE_DIR"
+            mkdir -p "$RELEASE_DIR"
+
+            TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')"
+
+            echo "Latest release tag: $TAG"
+
+            gh release download "$TAG"               --repo "$GITHUB_REPOSITORY"               --pattern "MRevisionDevBuildJan212025.apk"               --dir "$RELEASE_DIR"
+
+            APK="$RELEASE_DIR/MRevisionDevBuildJan212025.apk"
+          fi
+
+          if [ ! -s "$APK" ]; then
+            echo "ERROR: MRevisionDevBuildJan212025.apk was not found in the repo or latest Release."
             exit 1
           fi
 
