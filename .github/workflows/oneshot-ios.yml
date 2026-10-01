@@ -1,0 +1,556 @@
+name: OneShot APK to iOS v1 - Godot 4.3 Native
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build OneShot iOS from APK resources
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK=""
+
+          if [ -f "MRevisionDevBuildJan212025.apk" ]; then
+            APK="$GITHUB_WORKSPACE/MRevisionDevBuildJan212025.apk"
+          else
+            APK="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -iname '*.apk' -print -quit)"
+          fi
+
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "ERROR: APK not found. Put MRevisionDevBuildJan212025.apk in the repo root."
+            exit 1
+          fi
+
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          echo "Using APK: $APK"
+          ls -lh "$APK"
+
+      - name: Verify this is the expected Godot 4.3 OneShot APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "$RUNNER_TEMP/oneshot-apk"
+          mkdir -p "$RUNNER_TEMP/oneshot-apk"
+
+          unzip -q "$APK_PATH" -d "$RUNNER_TEMP/oneshot-apk"
+
+          ASSETS="$RUNNER_TEMP/oneshot-apk/assets"
+          LIB="$RUNNER_TEMP/oneshot-apk/lib/arm64-v8a/libgodot_android.so"
+
+          test -f "$ASSETS/project.binary"
+          test -f "$ASSETS/appIcon 1.png"
+          test -f "$LIB"
+          test -f "$ASSETS/Scenes/Interface/title_screen.tscn.remap"
+
+          strings "$LIB" | grep -q 'Godot Engine v4.3.stable.official'
+          strings "$ASSETS/project.binary" | grep -q '^OneShot$'
+          strings "$ASSETS/project.binary" | grep -q 'rendering/renderer/rendering_method'
+          strings "$ASSETS/project.binary" | grep -q '^mobile$'
+
+          NATIVE_PLUGIN_COUNT="$(find "$ASSETS" -type f \( -iname '*.gdextension' -o -iname '*.gdnlib' -o -iname '*.so' \) | wc -l | tr -d ' ')"
+
+          if [ "$NATIVE_PLUGIN_COUNT" != "0" ]; then
+            echo "ERROR: Android/native plugins were found inside game assets."
+            find "$ASSETS" -type f \( -iname '*.gdextension' -o -iname '*.gdnlib' -o -iname '*.so' \) -print
+            exit 1
+          fi
+
+          echo "ASSETS_PATH=$ASSETS" >> "$GITHUB_ENV"
+
+          echo "Godot version:"
+          strings "$LIB" | grep -m1 'Godot Engine v4.3.stable.official'
+          echo "GDScript bytecode files: $(find "$ASSETS" -type f -name '*.gdc' | wc -l | tr -d ' ')"
+          echo "Scenes: $(find "$ASSETS" -type f -name '*.scn' | wc -l | tr -d ' ')"
+          echo "Compressed textures: $(find "$ASSETS" -type f -name '*.ctex' | wc -l | tr -d ' ')"
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -d /Applications/Xcode_15.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+          elif [ -d /Applications/Xcode_16.0.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer
+          fi
+
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Download exact Godot 4.3 editor and iOS export templates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GODOT_DIR="$RUNNER_TEMP/godot43"
+          TEMPLATE_DIR="$HOME/Library/Application Support/Godot/export_templates/4.3.stable"
+
+          rm -rf "$GODOT_DIR"
+          mkdir -p "$GODOT_DIR"
+          mkdir -p "$TEMPLATE_DIR"
+
+          curl -fL --retry 4 --retry-delay 3 \
+            -o "$RUNNER_TEMP/godot43-macos.zip" \
+            "https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_macos.universal.zip"
+
+          curl -fL --retry 4 --retry-delay 3 \
+            -o "$RUNNER_TEMP/godot43-templates.tpz" \
+            "https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_export_templates.tpz"
+
+          unzip -q "$RUNNER_TEMP/godot43-macos.zip" -d "$GODOT_DIR"
+
+          rm -rf "$RUNNER_TEMP/godot43-templates"
+          mkdir -p "$RUNNER_TEMP/godot43-templates"
+          unzip -q "$RUNNER_TEMP/godot43-templates.tpz" -d "$RUNNER_TEMP/godot43-templates"
+
+          cp -R "$RUNNER_TEMP/godot43-templates/templates/." "$TEMPLATE_DIR/"
+
+          GODOT="$GODOT_DIR/Godot.app/Contents/MacOS/Godot"
+          chmod +x "$GODOT"
+
+          "$GODOT" --version | tee "$RUNNER_TEMP/godot-version.txt"
+          "$GODOT" --version | grep -q '^4\.3\.stable'
+
+          test -f "$TEMPLATE_DIR/ios.zip"
+
+          echo "GODOT=$GODOT" >> "$GITHUB_ENV"
+          echo "GODOT_TEMPLATE_DIR=$TEMPLATE_DIR" >> "$GITHUB_ENV"
+
+      - name: Build untouched OneShot resource pack from APK assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKER="$RUNNER_TEMP/pck-packer"
+          MANIFEST="$RUNNER_TEMP/oneshot-files.txt"
+          OUT_PCK="$GITHUB_WORKSPACE/oneshot-original-apk-data.pck"
+
+          rm -rf "$PACKER"
+          mkdir -p "$PACKER"
+
+          cat > "$PACKER/project.godot" <<'EOF'
+          config_version=5
+
+          [application]
+          config/name="OneShot PCK Builder"
+
+          [rendering]
+          renderer/rendering_method="gl_compatibility"
+          EOF
+
+          cat > "$PACKER/pack.gd" <<'EOF'
+          extends SceneTree
+
+          func fail(message: String, code: int = 1) -> void:
+              push_error(message)
+              quit(code)
+
+          func _initialize() -> void:
+              var args := OS.get_cmdline_user_args()
+              if args.size() != 3:
+                  fail("Expected: manifest assets_root output_pck")
+                  return
+
+              var manifest_path: String = args[0]
+              var assets_root: String = args[1]
+              var output_pck: String = args[2]
+
+              var manifest_text := FileAccess.get_file_as_string(manifest_path)
+              if manifest_text.is_empty():
+                  fail("Manifest is empty")
+                  return
+
+              var packer := PCKPacker.new()
+              var err := packer.pck_start(output_pck)
+              if err != OK:
+                  fail("pck_start failed: %s" % err)
+                  return
+
+              var count := 0
+              for raw_line in manifest_text.split("\n", false):
+                  var rel := String(raw_line).strip_edges()
+                  if rel.is_empty():
+                      continue
+
+                  var source := assets_root.path_join(rel)
+                  if not FileAccess.file_exists(source):
+                      fail("Source vanished: %s" % source)
+                      return
+
+                  err = packer.add_file("res://" + rel, source)
+                  if err != OK:
+                      fail("add_file failed for %s: %s" % [rel, err])
+                      return
+
+                  count += 1
+
+              err = packer.flush(true)
+              if err != OK:
+                  fail("flush failed: %s" % err)
+                  return
+
+              print("ONESHOT PCK CREATED - files: ", count)
+              quit(0)
+          EOF
+
+          cd "$ASSETS_PATH"
+          find . -type f -print | sed 's#^\./##' | LC_ALL=C sort > "$MANIFEST"
+
+          grep -qx 'project.binary' "$MANIFEST"
+          grep -qx 'Scenes/Interface/title_screen.tscn.remap' "$MANIFEST"
+
+          "$GODOT" \
+            --headless \
+            --path "$PACKER" \
+            --script "$PACKER/pack.gd" \
+            -- "$MANIFEST" "$ASSETS_PATH" "$OUT_PCK" \
+            2>&1 | tee "$RUNNER_TEMP/pck-build.log"
+
+          test -s "$OUT_PCK"
+
+          echo "ONESHOT_PCK=$OUT_PCK" >> "$GITHUB_ENV"
+          shasum -a 256 "$OUT_PCK" | tee "$RUNNER_TEMP/original-pck.sha256"
+          ls -lh "$OUT_PCK"
+
+      - name: Preflight original title scene with exact Godot 4.3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TESTER="$RUNNER_TEMP/oneshot-preflight"
+          rm -rf "$TESTER"
+          mkdir -p "$TESTER"
+
+          cat > "$TESTER/project.godot" <<'EOF'
+          config_version=5
+
+          [application]
+          config/name="OneShot Resource Preflight"
+
+          [rendering]
+          renderer/rendering_method="gl_compatibility"
+          EOF
+
+          cat > "$TESTER/test_pack.gd" <<'EOF'
+          extends SceneTree
+
+          func fail(message: String, code: int = 1) -> void:
+              push_error(message)
+              quit(code)
+
+          func _initialize() -> void:
+              var args := OS.get_cmdline_user_args()
+              if args.size() != 1:
+                  fail("Expected PCK path")
+                  return
+
+              var pck: String = args[0]
+              var err := ProjectSettings.load_resource_pack(pck, true)
+              if err != OK:
+                  fail("Could not mount OneShot PCK: %s" % err)
+                  return
+
+              var title_path := "res://Scenes/Interface/title_screen.tscn"
+              if not ResourceLoader.exists(title_path):
+                  fail("Original title_screen.tscn is not visible after mounting PCK")
+                  return
+
+              var scene := ResourceLoader.load(title_path)
+              if scene == null:
+                  fail("Godot 4.3 could not load original OneShot title scene")
+                  return
+
+              print("ONESHOT PREFLIGHT OK: original title scene loaded as ", scene.get_class())
+              quit(0)
+          EOF
+
+          "$GODOT" \
+            --headless \
+            --path "$TESTER" \
+            --script "$TESTER/test_pack.gd" \
+            -- "$ONESHOT_PCK" \
+            2>&1 | tee "$RUNNER_TEMP/oneshot-preflight.log"
+
+          grep -q 'ONESHOT PREFLIGHT OK' "$RUNNER_TEMP/oneshot-preflight.log"
+
+      - name: Create clean Godot 4.3 iOS shell
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WRAPPER="$RUNNER_TEMP/ios-wrapper"
+          rm -rf "$WRAPPER"
+          mkdir -p "$WRAPPER"
+
+          cp "$ASSETS_PATH/appIcon 1.png" "$WRAPPER/icon.png"
+
+          cat > "$WRAPPER/project.godot" <<'EOF'
+          config_version=5
+
+          [application]
+          config/name="OneShot"
+          run/main_scene="res://main.tscn"
+          config/icon="res://icon.png"
+
+          [display]
+          window/size/viewport_width=1280
+          window/size/viewport_height=720
+          window/stretch/mode="canvas_items"
+
+          [rendering]
+          renderer/rendering_method="mobile"
+          renderer/rendering_method.mobile="mobile"
+          textures/vram_compression/import_etc2_astc=true
+          EOF
+
+          cat > "$WRAPPER/main.tscn" <<'EOF'
+          [gd_scene format=3]
+
+          [node name="OneShotShell" type="Node"]
+          EOF
+
+          cat > "$WRAPPER/export_presets.cfg" <<'EOF'
+          [preset.0]
+
+          name="iOS"
+          platform="iOS"
+          runnable=true
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          export_path=""
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          encrypt_pck=false
+          encrypt_directory=false
+          script_export_mode=2
+
+          [preset.0.options]
+
+          custom_template/debug=""
+          custom_template/release=""
+          architectures/arm64=true
+          application/app_store_team_id="AAAAAAAAAA"
+          application/export_method_debug=1
+          application/code_sign_identity_debug=""
+          application/provisioning_profile_uuid_debug=""
+          application/export_method_release=0
+          application/code_sign_identity_release=""
+          application/provisioning_profile_uuid_release=""
+          application/bundle_identifier="com.oneshot.mobile.port"
+          application/signature="ONSH"
+          application/short_version="1.0"
+          application/version="1"
+          application/min_ios_version="13.0"
+          application/icon_interpolation=4
+          icons/app_store_1024x1024="res://icon.png"
+          icons/iphone_120x120="res://icon.png"
+          icons/iphone_180x180="res://icon.png"
+          orientation/portrait=false
+          orientation/landscape_left=true
+          orientation/landscape_right=true
+          orientation/portrait_upside_down=false
+          user_data/accessible_from_files_app=true
+          user_data/accessible_from_itunes_sharing=true
+          EOF
+
+          echo "WRAPPER=$WRAPPER" >> "$GITHUB_ENV"
+
+      - name: Export native Godot iOS Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPORT_ZIP="$GITHUB_WORKSPACE/OneShot-iOS-Xcode.zip"
+          rm -f "$EXPORT_ZIP"
+
+          "$GODOT" \
+            --headless \
+            --path "$WRAPPER" \
+            --export-release "iOS" "$EXPORT_ZIP" \
+            2>&1 | tee "$RUNNER_TEMP/ios-export.log"
+
+          test -s "$EXPORT_ZIP"
+
+          rm -rf "$GITHUB_WORKSPACE/ios-project"
+          mkdir -p "$GITHUB_WORKSPACE/ios-project"
+          unzip -q "$EXPORT_ZIP" -d "$GITHUB_WORKSPACE/ios-project"
+
+          XCODEPROJ="$(find "$GITHUB_WORKSPACE/ios-project" -type d -name '*.xcodeproj' -print -quit)"
+          PCK_TARGET="$(find "$GITHUB_WORKSPACE/ios-project" -type f -name '*.pck' -print -quit)"
+
+          if [ -z "$XCODEPROJ" ] || [ ! -d "$XCODEPROJ" ]; then
+            echo "ERROR: Godot did not export an Xcode project"
+            find "$GITHUB_WORKSPACE/ios-project" -maxdepth 3 -print
+            exit 1
+          fi
+
+          if [ -z "$PCK_TARGET" ] || [ ! -f "$PCK_TARGET" ]; then
+            echo "ERROR: exported iOS project has no PCK to replace"
+            find "$GITHUB_WORKSPACE/ios-project" -maxdepth 4 -print
+            exit 1
+          fi
+
+          echo "Xcode project: $XCODEPROJ"
+          echo "Godot shell PCK: $PCK_TARGET"
+
+          cp "$ONESHOT_PCK" "$PCK_TARGET"
+
+          cmp -s "$ONESHOT_PCK" "$PCK_TARGET"
+
+          echo "XCODEPROJ=$XCODEPROJ" >> "$GITHUB_ENV"
+          echo "IOS_PCK_TARGET=$PCK_TARGET" >> "$GITHUB_ENV"
+
+          shasum -a 256 "$PCK_TARGET" | tee "$RUNNER_TEMP/ios-project-pck.sha256"
+
+      - name: Resolve Xcode scheme
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SCHEME="$(xcodebuild -project "$XCODEPROJ" -list -json | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d.get("project",{}).get("schemes",[]); print(s[0] if s else "")')"
+
+          if [ -z "$SCHEME" ]; then
+            echo "ERROR: no Xcode scheme found"
+            xcodebuild -project "$XCODEPROJ" -list
+            exit 1
+          fi
+
+          echo "XCODE_SCHEME=$SCHEME" >> "$GITHUB_ENV"
+          echo "Scheme: $SCHEME"
+
+      - name: Build unsigned native iOS app
+        shell: bash
+        run: |
+          set -o pipefail
+
+          DERIVED="$GITHUB_WORKSPACE/build"
+          rm -rf "$DERIVED"
+
+          xcodebuild \
+            -project "$XCODEPROJ" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=13.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            PRODUCT_BUNDLE_IDENTIFIER=com.oneshot.mobile.port \
+            build \
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Verify app contains untouched OneShot APK resource pack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "ERROR: built .app not found"
+            find "$GITHUB_WORKSPACE/build/Build/Products" -maxdepth 3 -print || true
+            exit 1
+          fi
+
+          APP_PCK="$(find "$APP" -type f -name '*.pck' -print -quit)"
+
+          if [ -z "$APP_PCK" ] || [ ! -f "$APP_PCK" ]; then
+            echo "ERROR: final app has no OneShot PCK"
+            find "$APP" -maxdepth 3 -print
+            exit 1
+          fi
+
+          cmp -s "$ONESHOT_PCK" "$APP_PCK"
+
+          APP_BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          test -f "$APP_BIN"
+          lipo -info "$APP_BIN" | tee "$RUNNER_TEMP/app-architecture.txt"
+          lipo -info "$APP_BIN" | grep -q 'arm64'
+
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | tee "$RUNNER_TEMP/bundle-id.txt"
+
+          shasum -a 256 "$ONESHOT_PCK" "$APP_PCK" | tee "$RUNNER_TEMP/final-pck-compare.sha256"
+
+          echo "BUILT_APP=$APP" >> "$GITHUB_ENV"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="$GITHUB_WORKSPACE/out"
+          rm -rf "$OUT"
+          mkdir -p "$OUT/Payload"
+
+          cp -R "$BUILT_APP" "$OUT/Payload/OneShot.app"
+
+          cd "$OUT"
+          zip -qry "OneShot-Godot43-iOS-v1-unsigned.ipa" Payload
+
+          test -s "OneShot-Godot43-iOS-v1-unsigned.ipa"
+          ls -lh "OneShot-Godot43-iOS-v1-unsigned.ipa"
+
+      - name: Upload OneShot IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: OneShot-Godot43-iOS-v1-unsigned
+          path: out/OneShot-Godot43-iOS-v1-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Prepare diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+
+          cp "$RUNNER_TEMP/godot-version.txt" "$GITHUB_WORKSPACE/diagnostics/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/pck-build.log" "$GITHUB_WORKSPACE/diagnostics/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/oneshot-preflight.log" "$GITHUB_WORKSPACE/diagnostics/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/ios-export.log" "$GITHUB_WORKSPACE/diagnostics/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/xcodebuild.log" "$GITHUB_WORKSPACE/diagnostics/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/original-pck.sha256" "$GITHUB_WORKSPACE/diagnostics/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/ios-project-pck.sha256" "$GITHUB_WORKSPACE/diagnostics/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/final-pck-compare.sha256" "$GITHUB_WORKSPACE/diagnostics/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/app-architecture.txt" "$GITHUB_WORKSPACE/diagnostics/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/bundle-id.txt" "$GITHUB_WORKSPACE/diagnostics/" 2>/dev/null || true
+
+          if [ -n "${ASSETS_PATH:-}" ] && [ -d "$ASSETS_PATH" ]; then
+            {
+              echo "gdc=$(find "$ASSETS_PATH" -type f -name '*.gdc' | wc -l | tr -d ' ')"
+              echo "scn=$(find "$ASSETS_PATH" -type f -name '*.scn' | wc -l | tr -d ' ')"
+              echo "ctex=$(find "$ASSETS_PATH" -type f -name '*.ctex' | wc -l | tr -d ' ')"
+              echo "remap=$(find "$ASSETS_PATH" -type f -name '*.remap' | wc -l | tr -d ' ')"
+            } > "$GITHUB_WORKSPACE/diagnostics/resource-counts.txt"
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OneShot-Godot43-iOS-v1-diagnostics
+          path: diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
